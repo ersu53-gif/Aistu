@@ -1,0 +1,36 @@
+name: ASI-Omega Continuous Engine
+
+on:
+  push:
+    branches: [ main ]
+  schedule:
+    # Trigger otomatis setiap 5 jam untuk menjaga sesi tidak terputus limit GH Actions (6 jam)
+    - cron: '0 */5 * * 1-5'
+  workflow_dispatch:
+
+jobs:
+  run-asi-bot:
+    runs-on: ubuntu-latest
+    timeout-minutes: 330 # 5.5 Jam maksimum per run
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install Dependencies
+        run: |
+          pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run ASI Trading Bot
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          python main.py
