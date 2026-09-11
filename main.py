@@ -9,7 +9,7 @@ Features:
 - Quantitative Adaptive Volatility Bands (Ultra-Tight SL Engine)
 - Online Recursive Self-Improvement Memory via SQLite (Fixed Bindings)
 - Anti-Spam / Rate-Limiting Telegram Dispatcher
-- Self-Healing Async Loop & 24/5 Temporal Filter (Weekend Dormancy)
+- Self-Healing Async Loop & Dynamic Symbol Detection
 ================================================================================
 """
 
@@ -40,8 +40,12 @@ logger = logging.getLogger("ASI-Omega")
 # --- CONFIGURATION ENGINE ---
 class Config:
     DERIV_WS_URL = "wss://ws.derivws.com/websockets/v3?app_id=1089"
-    SYMBOL = "frxXAUUSD"  # Symbol resmi XAU/USD (Gold) di WebSocket API Deriv
-    GRANULARITY = 60  # 1-Minute Candles for ultra-precise entry
+    
+    # Daftar kandidat simbol Gold di Deriv WebSocket API (akan dicoba berurutan)
+    SYMBOL_CANDIDATES = ["frxXAUUSD", "XAUUSD", "gold"]
+    CURRENT_SYMBOL_INDEX = 0
+    
+    GRANULARITY = 60  # 1-Minute Candles
     HISTORY_COUNT = 150
     
     TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
@@ -49,13 +53,11 @@ class Config:
     
     DB_PATH = "asi_memory.db"
     
-    # Anti-Spam Configuration
-    MIN_SIGNAL_COOLDOWN_SECONDS = 300  # Minimal 5 menit jeda antar sinyal yang sama
+    MIN_SIGNAL_COOLDOWN_SECONDS = 300
     MAX_ALERTS_PER_HOUR = 8
     
-    # Adaptive Thresholds
     INITIAL_CONFIDENCE_THRESHOLD = 0.80
-    BASE_RISK_REWARD = 3.0  # R:R 1:3 target minimum
+    BASE_RISK_REWARD = 3.0
 
 if not Config.TELEGRAM_BOT_TOKEN or not Config.TELEGRAM_CHAT_ID:
     logger.warning("TELEGRAM_BOT_TOKEN atau TELEGRAM_CHAT_ID belum terdeteksi. Sinyal akan dicetak ke log.")
@@ -63,10 +65,6 @@ if not Config.TELEGRAM_BOT_TOKEN or not Config.TELEGRAM_CHAT_ID:
 
 # --- DATABASE: RECURSIVE LEARNING & SIGNAL TRACKER ---
 class MemoryMatrix:
-    """
-    Sistem memori persisten. Menyimpan bobot indikator, riwayat eksekusi sinyal,
-    dan memperbarui bobot model secara rekursif (Bayesian Adaptation).
-    """
     def __init__(self, db_path: str = Config.DB_PATH):
         self.db_path = db_path
         self._init_db()
@@ -101,7 +99,6 @@ class MemoryMatrix:
                 )
             """)
             
-            # Default model initialisation
             default_models = ["smc_sweep", "fvg_imbalance", "quant_zscore", "killzone_session"]
             for model in default_models:
                 cursor.execute("""
@@ -240,7 +237,6 @@ class ASIAnalyticsEngine:
         
         last_candle = candles[-2]
         
-        # Bearish Liquidity Sweep
         if last_candle['high'] > prev_swing_high and last_candle['close'] < prev_swing_high:
             wick_size = last_candle['high'] - max(last_candle['open'], last_candle['close'])
             body_size = abs(last_candle['close'] - last_candle['open'])
@@ -252,7 +248,6 @@ class ASIAnalyticsEngine:
                     "factor": "smc_sweep"
                 }
 
-        # Bullish Liquidity Sweep
         if last_candle['low'] < prev_swing_low and last_candle['close'] > prev_swing_low:
             wick_size = min(last_candle['open'], last_candle['close']) - last_candle['low']
             body_size = abs(last_candle['close'] - last_candle['open'])
@@ -273,13 +268,11 @@ class ASIAnalyticsEngine:
         
         c1, _, c3 = candles[-4], candles[-3], candles[-2]
         
-        # Bullish FVG
         if c3['low'] > c1['high']:
             gap = c3['low'] - c1['high']
             if gap > 0.15:
                 return {"type": "BUY", "factor": "fvg_imbalance"}
                 
-        # Bearish FVG
         if c3['high'] < c1['low']:
             gap = c1['low'] - c3['high']
             if gap > 0.15:
@@ -318,7 +311,7 @@ class TelegramGuard:
 
     async def send_message(self, text: str) -> bool:
         if not self.token or not self.chat_id:
-            logger.info(f"\n[TELEGRAM PREVIEW (Chat ID / Token Kosong)]:\n{text}\n")
+            logger.info(f"\n[TELEGRAM PREVIEW]:\n{text}\n")
             return True
 
         now = time.time()
@@ -370,19 +363,15 @@ class ASIAutonomousOrchestrator:
         self.last_signal_timestamp = 0.0
 
     def is_market_open(self) -> bool:
-        """
-        24/5 Temporal Filter: XAUUSD Tutup pada akhir pekan
-        (Jumat 22:00 UTC s/d Minggu 22:00 UTC)
-        """
         now_utc = datetime.now(timezone.utc)
         weekday = now_utc.weekday()
         hour = now_utc.hour
 
-        if weekday == 5:  # Sabtu
+        if weekday == 5:
             return False
-        if weekday == 6 and hour < 22:  # Minggu sebelum pembukaan
+        if weekday == 6 and hour < 22:
             return False
-        if weekday == 4 and hour >= 22:  # Jumat penutupan
+        if weekday == 4 and hour >= 22:
             return False
         return True
 
@@ -557,14 +546,16 @@ class ASIAutonomousOrchestrator:
                 await asyncio.sleep(1800)
                 continue
 
+            current_symbol = Config.SYMBOL_CANDIDATES[Config.CURRENT_SYMBOL_INDEX]
+
             try:
                 logger.info(f"Menghubungkan ke Deriv WebSocket: {Config.DERIV_WS_URL}...")
                 async with aiohttp.ClientSession() as session:
                     async with session.ws_connect(Config.DERIV_WS_URL, timeout=30, heartbeat=20) as ws:
-                        logger.info(f"WebSocket Terhubung! Melakukan subscribe ke {Config.SYMBOL}...")
+                        logger.info(f"WebSocket Terhubung! Melakukan subscribe ke {current_symbol}...")
                         
                         subscribe_req = {
-                            "ticks_history": Config.SYMBOL,
+                            "ticks_history": current_symbol,
                             "adjust_start_time": 1,
                             "count": Config.HISTORY_COUNT,
                             "end": "latest",
@@ -584,13 +575,23 @@ class ASIAutonomousOrchestrator:
                                 
                                 if "error" in data:
                                     err_code = data.get("error", {}).get("code", "")
-                                    logger.error(f"[DERIV ERROR] {data['error']['message']}")
-                                    if "MarketIsClosed" in err_code:
+                                    err_msg = data.get("error", {}).get("message", "")
+                                    logger.error(f"[DERIV ERROR] {err_msg}")
+                                    
+                                    # Rotasi Simbol jika terjadi error "Symbol is invalid"
+                                    if "invalid" in err_msg.lower() or "SymbolInvalid" in err_code:
+                                        Config.CURRENT_SYMBOL_INDEX = (Config.CURRENT_SYMBOL_INDEX + 1) % len(Config.SYMBOL_CANDIDATES)
+                                        next_sym = Config.SYMBOL_CANDIDATES[Config.CURRENT_SYMBOL_INDEX]
+                                        logger.info(f"[SYMBOL ROTATION] Mengganti simbol ke: {next_sym}")
+                                        await asyncio.sleep(2)
+                                        break
+                                    elif "MarketIsClosed" in err_code:
                                         logger.info("[MARKET CLOSED] Server mengonfirmasi market sedang libur. Tidur 15 menit...")
                                         await asyncio.sleep(900)
+                                        break
                                     else:
                                         await asyncio.sleep(5)
-                                    break
+                                        break
                                 
                                 if "candles" in data:
                                     raw_candles = data["candles"]
@@ -603,7 +604,7 @@ class ASIAutonomousOrchestrator:
                                             "close": float(c["close"])
                                         } for c in raw_candles
                                     ]
-                                    logger.info(f"Berhasil memuat {len(self.candles)} candlestick riwayat.")
+                                    logger.info(f"Berhasil memuat {len(self.candles)} candlestick riwayat untuk {current_symbol}.")
                                     await self.evaluate_market_matrix()
                                     
                                 elif "ohlc" in data:
@@ -623,8 +624,8 @@ class ASIAutonomousOrchestrator:
                 logger.critical(f"[CRITICAL ERROR] {e}", exc_info=True)
                 await asyncio.sleep(5)
 
-            logger.info("[AUTO-HEALING] Reconnecting dalam 5 detik...")
-            await asyncio.sleep(5)
+            logger.info("[AUTO-HEALING] Reconnecting dalam 3 detik...")
+            await asyncio.sleep(3)
 
 
 # --- APPLICATION ENTRY POINT ---
