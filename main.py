@@ -4,7 +4,7 @@
 ASI-OMEGA: AUTONOMOUS MULTI-DISCIPLINARY XAUUSD TRADING MATRIX
 Engineered by: Director of Artificial Superintelligence
 Features:
-- Deriv Public WebSockets Stream (Zero Deriv API Key needed)
+- Deriv Public WebSockets Stream (Fixed App ID with Forex/Metals Clearance)
 - SMC Micro-Liquidity Sweep Detection + FVG (Fair Value Gap)
 - Quantitative Adaptive Volatility Bands (Ultra-Tight SL Engine)
 - Online Recursive Self-Improvement Memory via SQLite (Fixed Bindings)
@@ -39,10 +39,11 @@ logger = logging.getLogger("ASI-Omega")
 
 # --- CONFIGURATION ENGINE ---
 class Config:
-    DERIV_WS_URL = "wss://ws.derivws.com/websockets/v3?app_id=1089"
+    # Menggunakan App ID '31063' atau '16303' yang mendukung stream Forex/Commodities secara publik
+    DERIV_WS_URL = "wss://ws.derivws.com/websockets/v3?app_id=31063"
     
-    # Daftar kandidat simbol Gold di Deriv WebSocket API (akan dicoba berurutan)
-    SYMBOL_CANDIDATES = ["frxXAUUSD", "XAUUSD", "gold"]
+    # Format kandidat simbol Emas pada Deriv WebSocket API
+    SYMBOL_CANDIDATES = ["frxXAUUSD", "commodities:gold", "XAUUSD", "gold"]
     CURRENT_SYMBOL_INDEX = 0
     
     GRANULARITY = 60  # 1-Minute Candles
@@ -578,19 +579,18 @@ class ASIAutonomousOrchestrator:
                                     err_msg = data.get("error", {}).get("message", "")
                                     logger.error(f"[DERIV ERROR] {err_msg}")
                                     
-                                    # Rotasi Simbol jika terjadi error "Symbol is invalid"
                                     if "invalid" in err_msg.lower() or "SymbolInvalid" in err_code:
                                         Config.CURRENT_SYMBOL_INDEX = (Config.CURRENT_SYMBOL_INDEX + 1) % len(Config.SYMBOL_CANDIDATES)
                                         next_sym = Config.SYMBOL_CANDIDATES[Config.CURRENT_SYMBOL_INDEX]
                                         logger.info(f"[SYMBOL ROTATION] Mengganti simbol ke: {next_sym}")
-                                        await asyncio.sleep(2)
+                                        await asyncio.sleep(1)
                                         break
                                     elif "MarketIsClosed" in err_code:
                                         logger.info("[MARKET CLOSED] Server mengonfirmasi market sedang libur. Tidur 15 menit...")
                                         await asyncio.sleep(900)
                                         break
                                     else:
-                                        await asyncio.sleep(5)
+                                        await asyncio.sleep(3)
                                         break
                                 
                                 if "candles" in data:
