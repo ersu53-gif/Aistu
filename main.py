@@ -4,12 +4,12 @@
 ASI-OMEGA: AUTONOMOUS MULTI-DISCIPLINARY XAUUSD TRADING MATRIX
 Engineered by: Director of Artificial Superintelligence
 Features:
-- Deriv Public WebSockets Stream (Fixed App ID with Forex/Metals Clearance)
+- Deriv Public WebSockets Stream (Fixed Strict API Payload & Valid App ID)
 - SMC Micro-Liquidity Sweep Detection + FVG (Fair Value Gap)
 - Quantitative Adaptive Volatility Bands (Ultra-Tight SL Engine)
-- Online Recursive Self-Improvement Memory via SQLite (Fixed Bindings)
+- Online Recursive Self-Improvement Memory via SQLite
 - Anti-Spam / Rate-Limiting Telegram Dispatcher
-- Self-Healing Async Loop & Dynamic Symbol Detection
+- Self-Healing Async Loop & Robust Symbol Detection
 ================================================================================
 """
 
@@ -39,11 +39,12 @@ logger = logging.getLogger("ASI-Omega")
 
 # --- CONFIGURATION ENGINE ---
 class Config:
-    # Menggunakan App ID '31063' atau '16303' yang mendukung stream Forex/Commodities secara publik
-    DERIV_WS_URL = "wss://ws.derivws.com/websockets/v3?app_id=31063"
+    # Membaca App ID dari Env Var jika ada, default menggunakan App ID resmi Deriv (1089)
+    APP_ID = os.getenv("DERIV_APP_ID", "1089").strip()
+    DERIV_WS_URL = f"wss://ws.derivws.com/websockets/v3?app_id={APP_ID}"
     
-    # Format kandidat simbol Emas pada Deriv WebSocket API
-    SYMBOL_CANDIDATES = ["frxXAUUSD", "commodities:gold", "XAUUSD", "gold"]
+    # Simbol resmi Deriv untuk Gold (Forex XAU/USD) adalah 'frxXAUUSD'
+    SYMBOL_CANDIDATES = ["frxXAUUSD", "XAUUSD"]
     CURRENT_SYMBOL_INDEX = 0
     
     GRANULARITY = 60  # 1-Minute Candles
@@ -555,9 +556,9 @@ class ASIAutonomousOrchestrator:
                     async with session.ws_connect(Config.DERIV_WS_URL, timeout=30, heartbeat=20) as ws:
                         logger.info(f"WebSocket Terhubung! Melakukan subscribe ke {current_symbol}...")
                         
+                        # Payload bersih tanpa opsi invalid
                         subscribe_req = {
                             "ticks_history": current_symbol,
-                            "adjust_start_time": 1,
                             "count": Config.HISTORY_COUNT,
                             "end": "latest",
                             "style": "candles",
