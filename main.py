@@ -4,12 +4,12 @@
 ASI-OMEGA: AUTONOMOUS MULTI-DISCIPLINARY XAUUSD TRADING MATRIX
 Engineered by: Director of Artificial Superintelligence
 Features:
-- Deriv Public WebSockets Stream (Fixed Strict API Payload & Valid App ID)
+- Deriv Dynamic Symbol Auto-Discovery Engine (Fixes 'Symbol Invalid' Errors)
 - SMC Micro-Liquidity Sweep Detection + FVG (Fair Value Gap)
 - Quantitative Adaptive Volatility Bands (Ultra-Tight SL Engine)
 - Online Recursive Self-Improvement Memory via SQLite
 - Anti-Spam / Rate-Limiting Telegram Dispatcher
-- Self-Healing Async Loop & Robust Symbol Detection
+- Self-Healing Async Loop & Robust WebSocket Feed
 ================================================================================
 """
 
@@ -39,13 +39,11 @@ logger = logging.getLogger("ASI-Omega")
 
 # --- CONFIGURATION ENGINE ---
 class Config:
-    # Membaca App ID dari Env Var jika ada, default menggunakan App ID resmi Deriv (1089)
     APP_ID = os.getenv("DERIV_APP_ID", "1089").strip()
     DERIV_WS_URL = f"wss://ws.derivws.com/websockets/v3?app_id={APP_ID}"
     
-    # Simbol resmi Deriv untuk Gold (Forex XAU/USD) adalah 'frxXAUUSD'
-    SYMBOL_CANDIDATES = ["frxXAUUSD", "XAUUSD"]
-    CURRENT_SYMBOL_INDEX = 0
+    # Target keyword untuk pencarian otomatis instrumen Emas
+    GOLD_KEYWORDS = ["XAUUSD", "GOLD", "FRXXAUUSD"]
     
     GRANULARITY = 60  # 1-Minute Candles
     HISTORY_COUNT = 150
@@ -62,7 +60,7 @@ class Config:
     BASE_RISK_REWARD = 3.0
 
 if not Config.TELEGRAM_BOT_TOKEN or not Config.TELEGRAM_CHAT_ID:
-    logger.warning("TELEGRAM_BOT_TOKEN atau TELEGRAM_CHAT_ID belum terdeteksi. Sinyal akan dicetak ke log.")
+    logger.warning("TELEGRAM_BOT_TOKEN atau TELEGRAM_CHAT_ID belum terdeteksi. Sinyal akan dicetak ke log console.")
 
 
 # --- DATABASE: RECURSIVE LEARNING & SIGNAL TRACKER ---
@@ -363,6 +361,7 @@ class ASIAutonomousOrchestrator:
         self.telegram = TelegramGuard(Config.TELEGRAM_BOT_TOKEN, Config.TELEGRAM_CHAT_ID)
         self.candles: List[Dict] = []
         self.last_signal_timestamp = 0.0
+        self.active_gold_symbol: Optional[str] = None
 
     def is_market_open(self) -> bool:
         now_utc = datetime.now(timezone.utc)
@@ -376,6 +375,36 @@ class ASIAutonomousOrchestrator:
         if weekday == 4 and hour >= 22:
             return False
         return True
+
+    async def discover_gold_symbol(self, ws) -> Optional[str]:
+        logger.info("[SYMBOL DISCOVERY] Meminta daftar active_symbols dari Deriv...")
+        req = {"active_symbols": "brief", "product_type": "basic"}
+        await ws.send_json(req)
+
+        async for msg in ws:
+            if msg.type == aiohttp.WSMsgType.TEXT:
+                data = json.loads(msg.data)
+                if "active_symbols" in data:
+                    symbols = data["active_symbols"]
+                    logger.info(f"[SYMBOL DISCOVERY] Menerima {len(symbols)} simbol dari server.")
+                    
+                    # Cari simbol yang cocok dengan keyword Gold
+                    for kw in Config.GOLD_KEYWORDS:
+                        for sym in symbols:
+                            symbol_code = sym.get("symbol", "")
+                            display_name = sym.get("display_name", "").upper()
+                            if kw in symbol_code.upper() or kw in display_name:
+                                logger.info(f"[SYMBOL MATCH] Ditemukan simbol Gold resmi: '{symbol_code}' ({sym.get('display_name')})")
+                                return symbol_code
+                                
+                    # Fallback default
+                    logger.warning("[SYMBOL DISCOVERY] Kunci spesifik tidak cocok. Menggunakan fallback 'frxXAUUSD'.")
+                    return "frxXAUUSD"
+                elif "error" in data:
+                    logger.error(f"[SYMBOL DISCOVERY ERROR] {data.get('error', {}).get('message')}")
+                    return "frxXAUUSD"
+
+        return "frxXAUUSD"
 
     def calculate_micro_sl_tp(self, direction: str, entry: float, sweep_extreme: Optional[float], atr_val: float) -> Tuple[float, float, float, float]:
         buffer = max(0.20, atr_val * 0.15)
@@ -548,17 +577,19 @@ class ASIAutonomousOrchestrator:
                 await asyncio.sleep(1800)
                 continue
 
-            current_symbol = Config.SYMBOL_CANDIDATES[Config.CURRENT_SYMBOL_INDEX]
-
             try:
                 logger.info(f"Menghubungkan ke Deriv WebSocket: {Config.DERIV_WS_URL}...")
                 async with aiohttp.ClientSession() as session:
                     async with session.ws_connect(Config.DERIV_WS_URL, timeout=30, heartbeat=20) as ws:
-                        logger.info(f"WebSocket Terhubung! Melakukan subscribe ke {current_symbol}...")
+                        logger.info("WebSocket Terhubung!")
                         
-                        # Payload bersih tanpa opsi invalid
+                        # Discovery simbol otomatis jika belum ditemukan
+                        if not self.active_gold_symbol:
+                            self.active_gold_symbol = await self.discover_gold_symbol(ws)
+
+                        logger.info(f"Melakukan subscribe stream candlestick ke: {self.active_gold_symbol}...")
                         subscribe_req = {
-                            "ticks_history": current_symbol,
+                            "ticks_history": self.active_gold_symbol,
                             "count": Config.HISTORY_COUNT,
                             "end": "latest",
                             "style": "candles",
@@ -578,13 +609,12 @@ class ASIAutonomousOrchestrator:
                                 if "error" in data:
                                     err_code = data.get("error", {}).get("code", "")
                                     err_msg = data.get("error", {}).get("message", "")
-                                    logger.error(f"[DERIV ERROR] {err_msg}")
+                                    logger.error(f"[DERIV ERROR] Code: {err_code} | Msg: {err_msg}")
                                     
                                     if "invalid" in err_msg.lower() or "SymbolInvalid" in err_code:
-                                        Config.CURRENT_SYMBOL_INDEX = (Config.CURRENT_SYMBOL_INDEX + 1) % len(Config.SYMBOL_CANDIDATES)
-                                        next_sym = Config.SYMBOL_CANDIDATES[Config.CURRENT_SYMBOL_INDEX]
-                                        logger.info(f"[SYMBOL ROTATION] Mengganti simbol ke: {next_sym}")
-                                        await asyncio.sleep(1)
+                                        logger.warning("[RE-DISCOVERING] Simbol ditolak. Mengeset ulang kriteria pencarian simbol...")
+                                        self.active_gold_symbol = None
+                                        await asyncio.sleep(2)
                                         break
                                     elif "MarketIsClosed" in err_code:
                                         logger.info("[MARKET CLOSED] Server mengonfirmasi market sedang libur. Tidur 15 menit...")
@@ -605,7 +635,7 @@ class ASIAutonomousOrchestrator:
                                             "close": float(c["close"])
                                         } for c in raw_candles
                                     ]
-                                    logger.info(f"Berhasil memuat {len(self.candles)} candlestick riwayat untuk {current_symbol}.")
+                                    logger.info(f"Berhasil memuat {len(self.candles)} candlestick riwayat untuk {self.active_gold_symbol}.")
                                     await self.evaluate_market_matrix()
                                     
                                 elif "ohlc" in data:
