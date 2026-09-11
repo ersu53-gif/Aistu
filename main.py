@@ -40,7 +40,7 @@ logger = logging.getLogger("ASI-Omega")
 # --- CONFIGURATION ENGINE ---
 class Config:
     DERIV_WS_URL = "wss://ws.derivws.com/websockets/v3?app_id=1089"
-    SYMBOL = "frxXAUUSD"
+    SYMBOL = "gold"  # Symbol resmi Gold di WebSocket API Deriv
     GRANULARITY = 60  # 1-Minute Candles for ultra-precise entry
     HISTORY_COUNT = 150
     
@@ -104,7 +104,6 @@ class MemoryMatrix:
             # Default model initialisation
             default_models = ["smc_sweep", "fvg_imbalance", "quant_zscore", "killzone_session"]
             for model in default_models:
-                # PERBAIKAN: Parameter tuple (model,) disediakan untuk binding '?'
                 cursor.execute("""
                     INSERT OR IGNORE INTO model_weights (model_name, weight, wins, losses)
                     VALUES (?, 1.0, 0, 0)
@@ -503,7 +502,7 @@ class ASIAutonomousOrchestrator:
                 msg = (
                     f"⚡ <b>ASI-OMEGA TRADING SIGNAL</b> ⚡\n"
                     f"────────────────────────\n"
-                    f"Instrument: <code>{Config.SYMBOL} (XAU/USD)</code>\n"
+                    f"Instrument: <code>XAU/USD (Gold)</code>\n"
                     f"Order Type: <b>MANUAL OP</b>\n"
                     f"Action: {direction_emoji}\n"
                     f"Accuracy Probability: <b>{final_confidence*100:.1f}%</b>\n"
@@ -544,7 +543,7 @@ class ASIAutonomousOrchestrator:
             status_emoji = "✅" if "TP" in cs["status"] else "❌"
             feedback_msg = (
                 f"{status_emoji} <b>SIGNAL RESOLUTION #{cs['id']}</b>\n"
-                f"Result: <b>{cs['status']}</b> on {Config.SYMBOL}\n"
+                f"Result: <b>{cs['status']}</b> on XAU/USD\n"
                 f"Matriks bobot adaptif diperbarui secara mandiri via Bayesian feedback loop."
             )
             await self.telegram.send_message(feedback_msg)
