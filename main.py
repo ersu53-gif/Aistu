@@ -7,7 +7,7 @@ Features:
 - Deriv Public WebSockets Stream (Zero Deriv API Key needed)
 - SMC Micro-Liquidity Sweep Detection + FVG (Fair Value Gap)
 - Quantitative Adaptive Volatility Bands (Ultra-Tight SL Engine)
-- Online Recursive Self-Improvement Memory via SQLite
+- Online Recursive Self-Improvement Memory via SQLite (Fixed Bindings)
 - Anti-Spam / Rate-Limiting Telegram Dispatcher
 - Self-Healing Async Loop & 24/5 Temporal Filter (Weekend Dormancy)
 ================================================================================
@@ -21,7 +21,7 @@ import math
 import sqlite3
 import logging
 import asyncio
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timezone
 from typing import Dict, List, Optional, Tuple, Any
 
 import aiohttp
@@ -54,18 +54,18 @@ class Config:
     MAX_ALERTS_PER_HOUR = 8
     
     # Adaptive Thresholds
-    INITIAL_CONFIDENCE_THRESHOLD = 0.82
+    INITIAL_CONFIDENCE_THRESHOLD = 0.80
     BASE_RISK_REWARD = 3.0  # R:R 1:3 target minimum
 
 if not Config.TELEGRAM_BOT_TOKEN or not Config.TELEGRAM_CHAT_ID:
-    logger.warning("TELEGRAM_BOT_TOKEN atau TELEGRAM_CHAT_ID belum diatur! Bot akan tetap menganalisa dan mencetak log sinyal ke konsol.")
+    logger.warning("TELEGRAM_BOT_TOKEN atau TELEGRAM_CHAT_ID belum terdeteksi. Sinyal akan dicetak ke log.")
 
 
 # --- DATABASE: RECURSIVE LEARNING & SIGNAL TRACKER ---
 class MemoryMatrix:
     """
-    Sistem memori persisten. Menyimpan bobot indikator, hasil sinyal masa lalu,
-    dan menyesuaikan bobot model secara adaptif (Recursive Bayesian Learning).
+    Sistem memori persisten. Menyimpan bobot indikator, riwayat eksekusi sinyal,
+    dan memperbarui bobot model secara rekursif (Bayesian Adaptation).
     """
     def __init__(self, db_path: str = Config.DB_PATH):
         self.db_path = db_path
@@ -77,7 +77,6 @@ class MemoryMatrix:
     def _init_db(self):
         with self._get_conn() as conn:
             cursor = conn.cursor()
-            # Tabel Sinyal Aktif / Riwayat
             cursor.execute("""
                 CREATE TABLE IF NOT EXISTS signals (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -87,13 +86,12 @@ class MemoryMatrix:
                     sl REAL,
                     tp1 REAL,
                     tp2 REAL,
-                    status TEXT, -- 'PENDING', 'HIT_TP1', 'HIT_TP2', 'HIT_SL', 'EXPIRED'
+                    status TEXT,
                     model_confluence TEXT,
                     max_favorable REAL,
                     max_adverse REAL
                 )
             """)
-            # Tabel Bobot Model (Self-Improvement Weights)
             cursor.execute("""
                 CREATE TABLE IF NOT EXISTS model_weights (
                     model_name TEXT PRIMARY KEY,
@@ -103,13 +101,14 @@ class MemoryMatrix:
                 )
             """)
             
-            # Inisialisasi bobot default jika kosong
+            # Default model initialisation
             default_models = ["smc_sweep", "fvg_imbalance", "quant_zscore", "killzone_session"]
             for model in default_models:
+                # PERBAIKAN: Parameter tuple (model,) disediakan untuk binding '?'
                 cursor.execute("""
                     INSERT OR IGNORE INTO model_weights (model_name, weight, wins, losses)
                     VALUES (?, 1.0, 0, 0)
-                """)
+                """, (model,))
             conn.commit()
 
     def get_weights(self) -> Dict[str, float]:
@@ -129,14 +128,13 @@ class MemoryMatrix:
             return cursor.lastrowid
 
     def update_tracking(self, current_high: float, current_low: float, current_close: float) -> List[Dict]:
-        """
-        Mengevaluasi sinyal pending terhadap pergerakan chart real-time.
-        Jika menyentuh TP atau SL, eksekusi pembaruan bobot pembelajaran (Self-Improvement).
-        """
         closed_signals = []
         with self._get_conn() as conn:
             cursor = conn.cursor()
-            cursor.execute("SELECT id, direction, entry_price, sl, tp1, tp2, model_confluence, max_favorable, max_adverse FROM signals WHERE status = 'PENDING'")
+            cursor.execute("""
+                SELECT id, direction, entry_price, sl, tp1, tp2, model_confluence, max_favorable, max_adverse 
+                FROM signals WHERE status = 'PENDING'
+            """)
             rows = cursor.fetchall()
             
             for row in rows:
@@ -144,7 +142,7 @@ class MemoryMatrix:
                 confluence = json.loads(confluence_json)
                 
                 status = "PENDING"
-                outcome = 0 # +1 win, -1 loss
+                outcome = 0
                 
                 if direction == "BUY":
                     max_fav = max(max_fav, current_high - entry)
@@ -159,7 +157,7 @@ class MemoryMatrix:
                     elif current_high >= tp1 and status == "PENDING":
                         status = "HIT_TP1"
                         outcome = 1
-                else: # SELL
+                else:  # SELL
                     max_fav = max(max_fav, entry - current_low)
                     max_adv = max(max_adv, current_high - entry)
                     
@@ -183,11 +181,6 @@ class MemoryMatrix:
         return closed_signals
 
     def _recursively_adapt_weights(self, cursor: sqlite3.Cursor, confluence: List[str], outcome: int):
-        """
-        Bayesian Updating Rule:
-        Jika indikator memicu win, naikkan reliabilitasnya sebesar +5%.
-        Jika memicu loss, reduksi reliabilitasnya sebesar -8% (asimetrik risk aversion).
-        """
         for factor in confluence:
             cursor.execute("SELECT weight, wins, losses FROM model_weights WHERE model_name = ?", (factor,))
             res = cursor.fetchone()
@@ -200,19 +193,13 @@ class MemoryMatrix:
                     new_w = max(0.2, w * 0.92)
                     losses += 1
                 cursor.execute("UPDATE model_weights SET weight = ?, wins = ?, losses = ? WHERE model_name = ?", (new_w, wins, losses, factor))
-        logger.info(f"[RECURSIVE-LEARNING] Memory updated for models {confluence} with outcome: {outcome}")
+        logger.info(f"[SELF-IMPROVEMENT] Bobot diperbarui untuk faktor {confluence} | Outcome: {outcome}")
 
 
 # --- ANALYTICAL ENGINE: MULTI-DISCIPLINARY FUSION ---
 class ASIAnalyticsEngine:
     @staticmethod
     def get_current_session(utc_time: datetime) -> Tuple[str, bool]:
-        """
-        Analisis Sesi Pasar:
-        - Asian Session: 00:00 - 07:00 UTC (Liquidity Accumulation)
-        - London Killzone: 07:00 - 11:00 UTC (Manipulation & Breakout)
-        - New York Killzone: 12:00 - 17:00 UTC (High Volatility Expansion)
-        """
         hour = utc_time.hour
         if 7 <= hour < 11:
             return "LONDON_KILLZONE", True
@@ -225,9 +212,12 @@ class ASIAnalyticsEngine:
 
     @staticmethod
     def compute_atr(candles: List[Dict], period: int = 14) -> np.ndarray:
-        highs = np.array([c['high'] for c in candles])
-        lows = np.array([c['low'] for c in candles])
-        closes = np.array([c['close'] for c in candles])
+        if len(candles) < period + 1:
+            return np.array([1.2] * len(candles))
+            
+        highs = np.array([c['high'] for c in candles], dtype=float)
+        lows = np.array([c['low'] for c in candles], dtype=float)
+        closes = np.array([c['close'] for c in candles], dtype=float)
         
         tr = np.maximum(highs[1:] - lows[1:], 
              np.maximum(np.abs(highs[1:] - closes[:-1]), 
@@ -241,11 +231,6 @@ class ASIAnalyticsEngine:
 
     @staticmethod
     def detect_liquidity_sweep(candles: List[Dict], lookback: int = 20) -> Optional[Dict[str, Any]]:
-        """
-        Smart Money Concepts (SMC):
-        Mendeteksi pembantaian likuiditas (Liquidity Sweep).
-        Wick menembus High/Low sebelumnya namun Close kembali ke dalam range (Fakeout/Spring).
-        """
         if len(candles) < lookback + 2:
             return None
 
@@ -254,13 +239,13 @@ class ASIAnalyticsEngine:
         prev_swing_high = max(recent_highs)
         prev_swing_low = min(recent_lows)
         
-        last_candle = candles[-2] # Evaluasi candle terkonfirmasi terakhir
+        last_candle = candles[-2]
         
-        # Bearish Liquidity Sweep (Bait Buy Side Liquidity, lalu ditolak ke bawah)
+        # Bearish Liquidity Sweep
         if last_candle['high'] > prev_swing_high and last_candle['close'] < prev_swing_high:
             wick_size = last_candle['high'] - max(last_candle['open'], last_candle['close'])
             body_size = abs(last_candle['close'] - last_candle['open'])
-            if wick_size > body_size * 0.8:
+            if wick_size > body_size * 0.7:
                 return {
                     "type": "SELL",
                     "sweep_level": prev_swing_high,
@@ -268,11 +253,11 @@ class ASIAnalyticsEngine:
                     "factor": "smc_sweep"
                 }
 
-        # Bullish Liquidity Sweep (Bait Sell Side Liquidity, lalu ditolak ke atas)
+        # Bullish Liquidity Sweep
         if last_candle['low'] < prev_swing_low and last_candle['close'] > prev_swing_low:
             wick_size = min(last_candle['open'], last_candle['close']) - last_candle['low']
             body_size = abs(last_candle['close'] - last_candle['open'])
-            if wick_size > body_size * 0.8:
+            if wick_size > body_size * 0.7:
                 return {
                     "type": "BUY",
                     "sweep_level": prev_swing_low,
@@ -284,38 +269,30 @@ class ASIAnalyticsEngine:
 
     @staticmethod
     def detect_fvg(candles: List[Dict]) -> Optional[Dict[str, Any]]:
-        """
-        Fair Value Gap (FVG) / Imbalance 3-Candle Structure:
-        Ketidakseimbangan orderbook agresif yang meninggalkan celah harga.
-        """
-        if len(candles) < 3:
+        if len(candles) < 4:
             return None
         
-        c1, c2, c3 = candles[-4], candles[-3], candles[-2]
+        c1, _, c3 = candles[-4], candles[-3], candles[-2]
         
-        # Bullish FVG: Low candle 3 berada di atas High candle 1
+        # Bullish FVG
         if c3['low'] > c1['high']:
             gap = c3['low'] - c1['high']
-            if gap > 0.15: # Minimum gap signifikan pada XAUUSD ($0.15)
-                return {"type": "BUY", "fvg_bottom": c1['high'], "fvg_top": c3['low'], "factor": "fvg_imbalance"}
+            if gap > 0.15:
+                return {"type": "BUY", "factor": "fvg_imbalance"}
                 
-        # Bearish FVG: High candle 3 berada di bawah Low candle 1
+        # Bearish FVG
         if c3['high'] < c1['low']:
             gap = c1['low'] - c3['high']
             if gap > 0.15:
-                return {"type": "SELL", "fvg_bottom": c3['high'], "fvg_top": c1['low'], "factor": "fvg_imbalance"}
+                return {"type": "SELL", "factor": "fvg_imbalance"}
                 
         return None
 
     @staticmethod
     def evaluate_quant_zscore(candles: List[Dict], period: int = 20) -> Optional[Dict[str, Any]]:
-        """
-        Statistical Arbitrage:
-        Z-Score harga terhadap Moving Average. Menghitung kondisi Overextended ekstrim.
-        """
         if len(candles) < period:
             return None
-        closes = np.array([c['close'] for c in candles[-period:]])
+        closes = np.array([c['close'] for c in candles[-period:]], dtype=float)
         mean = np.mean(closes)
         std = np.std(closes)
         if std == 0:
@@ -324,20 +301,16 @@ class ASIAnalyticsEngine:
         current_close = closes[-1]
         z_score = (current_close - mean) / std
         
-        if z_score >= 2.2: # Overbought ekstrim
-            return {"type": "SELL", "zscore": z_score, "factor": "quant_zscore"}
-        elif z_score <= -2.2: # Oversold ekstrim
-            return {"type": "BUY", "zscore": z_score, "factor": "quant_zscore"}
+        if z_score >= 2.1:
+            return {"type": "SELL", "factor": "quant_zscore"}
+        elif z_score <= -2.1:
+            return {"type": "BUY", "factor": "quant_zscore"}
             
         return None
 
 
 # --- TELEGRAM DISPATCHER & RATE LIMITER ---
 class TelegramGuard:
-    """
-    Sistem pengiriman sinyal aman, anti-spam, dan anti-ban.
-    Memiliki internal rate-limiter dan cooldown buffer.
-    """
     def __init__(self, token: str, chat_id: str):
         self.token = token
         self.chat_id = chat_id
@@ -346,21 +319,18 @@ class TelegramGuard:
 
     async def send_message(self, text: str) -> bool:
         if not self.token or not self.chat_id:
-            logger.info(f"\n[TELEGRAM PREVIEW (No Token Configured)]:\n{text}\n")
+            logger.info(f"\n[TELEGRAM PREVIEW (Chat ID / Token Kosong)]:\n{text}\n")
             return True
 
         now = time.time()
-        
-        # Bersihkan history lebih dari 1 jam
         self.sent_history = [t for t in self.sent_history if now - t < 3600]
         
-        # Anti-Flood Filter
         if len(self.sent_history) >= Config.MAX_ALERTS_PER_HOUR:
-            logger.warning("[ANTI-SPAM] Maximum hourly alert quota reached. Throttling message.")
+            logger.warning("[ANTI-SPAM] Batas per jam tercapai. Menahan sinyal.")
             return False
             
         if now - self.last_sent_time < 3.0:
-            await asyncio.sleep(3.0) # Jeda antar pesan agar tidak terkena rate limit Telegram
+            await asyncio.sleep(3.0)
 
         url = f"https://api.telegram.org/bot{self.token}/sendMessage"
         payload = {
@@ -377,15 +347,15 @@ class TelegramGuard:
                         if response.status == 200:
                             self.last_sent_time = time.time()
                             self.sent_history.append(self.last_sent_time)
-                            logger.info("[TELEGRAM] Sinyal berhasil dikirim ke Channel/User.")
+                            logger.info("[TELEGRAM] Sinyal berhasil dipancarkan.")
                             return True
                         elif response.status == 429:
                             retry_after = int(response.headers.get("Retry-After", "5"))
-                            logger.warning(f"[TELEGRAM] 429 Rate Limit. Sleeping {retry_after}s...")
+                            logger.warning(f"[TELEGRAM] 429 Rate Limit. Tidur {retry_after}s...")
                             await asyncio.sleep(retry_after)
                         else:
                             resp_txt = await response.text()
-                            logger.error(f"[TELEGRAM ERROR] Status: {response.status}, Detail: {resp_txt}")
+                            logger.error(f"[TELEGRAM ERROR] {response.status}: {resp_txt}")
             except Exception as e:
                 logger.error(f"[TELEGRAM NETWORK FAILURE] Percobaan {attempt+1}/3: {e}")
                 await asyncio.sleep(2)
@@ -402,28 +372,23 @@ class ASIAutonomousOrchestrator:
 
     def is_market_open(self) -> bool:
         """
-        Cek 24/5 Non-Stop.
-        Pasar Forex/Gold tutup pada hari Sabtu & Minggu (Mulai Jumat 21:00 UTC s/d Minggu 22:00 UTC).
+        24/5 Temporal Filter: XAUUSD Tutup pada akhir pekan
+        (Jumat 22:00 UTC s/d Minggu 22:00 UTC)
         """
         now_utc = datetime.now(timezone.utc)
-        weekday = now_utc.weekday() # 0 = Senin, 4 = Jumat, 5 = Sabtu, 6 = Minggu
+        weekday = now_utc.weekday()
         hour = now_utc.hour
 
-        if weekday == 5: # Sabtu
+        if weekday == 5:  # Sabtu
             return False
-        if weekday == 6 and hour < 22: # Minggu sebelum buka
+        if weekday == 6 and hour < 22:  # Minggu sebelum pembukaan
             return False
-        if weekday == 4 and hour >= 22: # Jumat larut malam
+        if weekday == 4 and hour >= 22:  # Jumat penutupan
             return False
         return True
 
     def calculate_micro_sl_tp(self, direction: str, entry: float, sweep_extreme: Optional[float], atr_val: float) -> Tuple[float, float, float, float]:
-        """
-        Ultra-Tight Stop Loss Calculation:
-        Stop Loss diletakkan sangat presisi persis beberapa pip di luar High/Low penolakan likuiditas,
-        dengan batasan buffer elastis berdasarkan ATR.
-        """
-        buffer = max(0.20, atr_val * 0.15) # Buffer minimum $0.20 pada Gold
+        buffer = max(0.20, atr_val * 0.15)
         
         if direction == "BUY":
             if sweep_extreme and sweep_extreme < entry:
@@ -431,9 +396,7 @@ class ASIAutonomousOrchestrator:
             else:
                 sl = entry - (atr_val * 0.75)
             
-            risk = entry - sl
-            # Proteksi jika SL terlalu dekat (< $0.40) atau terlalu jauh (> $2.50)
-            risk = max(0.40, min(risk, 2.50))
+            risk = max(0.40, min(entry - sl, 2.50))
             sl = round(entry - risk, 2)
             tp1 = round(entry + (risk * 2.0), 2)
             tp2 = round(entry + (risk * Config.BASE_RISK_REWARD), 2)
@@ -443,8 +406,7 @@ class ASIAutonomousOrchestrator:
             else:
                 sl = entry + (atr_val * 0.75)
                 
-            risk = sl - entry
-            risk = max(0.40, min(risk, 2.50))
+            risk = max(0.40, min(sl - entry, 2.50))
             sl = round(entry + risk, 2)
             tp1 = round(entry - (risk * 2.0), 2)
             tp2 = round(entry - (risk * Config.BASE_RISK_REWARD), 2)
@@ -452,25 +414,19 @@ class ASIAutonomousOrchestrator:
         return entry, sl, tp1, tp2
 
     async def evaluate_market_matrix(self):
-        """
-        Inti Analisis Superintelejen: Menggabungkan semua model, mengalikan bobot
-        dari memori pembelajaran persisten, memvalidasi probabilitas.
-        """
         if len(self.candles) < 30:
             return
 
         now_utc = datetime.now(timezone.utc)
-        session_name, is_high_volume_kz = self.ASIAnalyticsEngine_session(now_utc)
+        session_name, is_high_volume_kz = ASIAnalyticsEngine.get_current_session(now_utc)
         
-        # Jalankan Sub-Model
         sweep_data = ASIAnalyticsEngine.detect_liquidity_sweep(self.candles)
         fvg_data = ASIAnalyticsEngine.detect_fvg(self.candles)
         quant_data = ASIAnalyticsEngine.evaluate_quant_zscore(self.candles)
         
         atr_series = ASIAnalyticsEngine.compute_atr(self.candles)
-        current_atr = atr_series[-1] if len(atr_series) > 0 and atr_series[-1] > 0 else 1.2
+        current_atr = float(atr_series[-1]) if len(atr_series) > 0 and atr_series[-1] > 0 else 1.2
         
-        # Ambil bobot pembelajaran dari SQLite
         weights = self.memory.get_weights()
         
         buy_score = 0.0
@@ -502,7 +458,7 @@ class ASIAutonomousOrchestrator:
             w = weights.get("quant_zscore", 1.0)
             if quant_data["type"] == "BUY":
                 buy_score += 1.2 * w
-                confluences.append(f"Quant Oversold Reversal (W:{w:.2f})")
+                confluences.append(f"Quant Oversold Exhaustion (W:{w:.2f})")
             else:
                 sell_score += 1.2 * w
                 confluences.append(f"Quant Overbought Exhaustion (W:{w:.2f})")
@@ -513,10 +469,8 @@ class ASIAutonomousOrchestrator:
             buy_score *= (1.0 + (0.15 * w))
             sell_score *= (1.0 + (0.15 * w))
 
-        # Normalisasi Probabilitas Menggunakan Fungsi Sigmoid Adaptif
         current_close = self.candles[-1]['close']
-        
-        threshold = 3.2 # Skor gabungan minimum
+        threshold = 3.0
         decision = None
         final_confidence = 0.0
 
@@ -527,7 +481,6 @@ class ASIAutonomousOrchestrator:
             decision = "SELL"
             final_confidence = 1.0 / (1.0 + math.exp(-sell_score / 2.5))
 
-        # Validasi Akhir dan Anti-Spam Cooldown
         now_ts = time.time()
         if decision and final_confidence >= Config.INITIAL_CONFIDENCE_THRESHOLD:
             if now_ts - self.last_signal_timestamp > Config.MIN_SIGNAL_COOLDOWN_SECONDS:
@@ -535,7 +488,6 @@ class ASIAutonomousOrchestrator:
                 risk_dist = abs(entry - sl)
                 rr_ratio = abs(tp2 - entry) / risk_dist if risk_dist > 0 else 0
                 
-                # Simpan ke Database untuk Pembelajaran Masa Depan
                 factor_keys = []
                 if sweep_data: factor_keys.append("smc_sweep")
                 if fvg_data: factor_keys.append("fvg_imbalance")
@@ -545,49 +497,41 @@ class ASIAutonomousOrchestrator:
                 sig_id = self.memory.record_signal(decision, entry, sl, tp1, tp2, factor_keys)
                 self.last_signal_timestamp = now_ts
 
-                # Dispatching Notifikasi ke Telegram
                 confluence_text = "\n".join([f"  • {c}" for c in confluences])
                 direction_emoji = "🟢 <b>STRONG BUY</b>" if decision == "BUY" else "🔴 <b>STRONG SELL</b>"
                 
                 msg = (
-                    f"⚡ <b>ASI-OMEGA SUPER-INTELLIGENCE SIGNAL</b> ⚡\n"
+                    f"⚡ <b>ASI-OMEGA TRADING SIGNAL</b> ⚡\n"
                     f"────────────────────────\n"
                     f"Instrument: <code>{Config.SYMBOL} (XAU/USD)</code>\n"
                     f"Order Type: <b>MANUAL OP</b>\n"
                     f"Action: {direction_emoji}\n"
-                    f"Probabilitas Akurasi: <b>{final_confidence*100:.1f}%</b>\n"
+                    f"Accuracy Probability: <b>{final_confidence*100:.1f}%</b>\n"
                     f"────────────────────────\n"
                     f"📍 <b>Entry Price:</b> <code>{entry:.2f}</code>\n"
                     f"🛡️ <b>Micro Stop Loss:</b> <code>{sl:.2f}</code> (Risk: ${risk_dist:.2f})\n"
                     f"🎯 <b>Take Profit 1:</b> <code>{tp1:.2f}</code> (1:2 R:R)\n"
                     f"🎯 <b>Take Profit 2:</b> <code>{tp2:.2f}</code> (1:{rr_ratio:.1f} R:R)\n"
                     f"────────────────────────\n"
-                    f"<b>Confluence Factor:</b>\n{confluence_text}\n"
+                    f"<b>Confluences:</b>\n{confluence_text}\n"
                     f"Session: <code>{session_name}</code>\n"
                     f"Tracking Ticket: <code>#{sig_id}</code>\n"
-                    f"Waktu UTC: <code>{now_utc.strftime('%Y-%m-%d %H:%M:%S')}</code>\n"
-                    f"────────────────────────\n"
-                    f"⚠️ <i>Gunakan lot bijak sesuai batas margin akun Anda.</i>"
+                    f"UTC: <code>{now_utc.strftime('%Y-%m-%d %H:%M:%S')}</code>\n"
+                    f"────────────────────────"
                 )
                 
                 await self.telegram.send_message(msg)
 
-    def ASIAnalyticsEngine_session(self, utc_time: datetime):
-        return ASIAnalyticsEngine.get_current_session(utc_time)
-
     async def process_incoming_candle(self, candle_data: Dict[str, Any]):
-        """
-        Sinkronisasi candle M1 real-time ke dalam memory window.
-        """
+        candle_epoch = int(candle_data.get("open_time") or candle_data.get("epoch") or time.time())
         c = {
-            "epoch": candle_data.get("epoch", time.time()),
+            "epoch": candle_epoch,
             "open": float(candle_data["open"]),
             "high": float(candle_data["high"]),
             "low": float(candle_data["low"]),
             "close": float(candle_data["close"])
         }
         
-        # Update atau append candle
         if self.candles and self.candles[-1]['epoch'] == c['epoch']:
             self.candles[-1] = c
         else:
@@ -595,40 +539,31 @@ class ASIAutonomousOrchestrator:
             if len(self.candles) > Config.HISTORY_COUNT:
                 self.candles.pop(0)
 
-        # Monitor sinyal pending real-time terhadap harga saat ini (Self-Learning Loop)
         closed_signals = self.memory.update_tracking(c['high'], c['low'], c['close'])
         for cs in closed_signals:
             status_emoji = "✅" if "TP" in cs["status"] else "❌"
             feedback_msg = (
-                f"{status_emoji} <b>SIGNAL RESOLUTION REPORT</b> #{cs['id']}\n"
-                f"Instrument: {Config.SYMBOL}\n"
-                f"Result: <b>{cs['status']}</b>\n"
-                f"Sistem telah memperbarui matriks bobot indikator secara mandiri via Bayesian Learning."
+                f"{status_emoji} <b>SIGNAL RESOLUTION #{cs['id']}</b>\n"
+                f"Result: <b>{cs['status']}</b> on {Config.SYMBOL}\n"
+                f"Matriks bobot adaptif diperbarui secara mandiri via Bayesian feedback loop."
             )
             await self.telegram.send_message(feedback_msg)
 
-        # Jalankan evaluasi prediktif superintelejen
         await self.evaluate_market_matrix()
 
     async def run_deriv_stream(self):
-        """
-        Koneksi WebSocket Publik Deriv yang stabil, auto-reconnect,
-        dan kebal terhadap pemutusan koneksi server.
-        """
         while True:
-            # Pengecekan 24/5 Temporal Filter
             if not self.is_market_open():
-                logger.info("[WEEKEND DORMANCY] Market XAUUSD sedang libur akhir pekan. Bot mode hemat daya (tidur 30 menit)...")
+                logger.info("[WEEKEND DORMANCY] Market XAUUSD sedang libur. Standby mode 30 menit...")
                 await asyncio.sleep(1800)
                 continue
 
             try:
-                logger.info(f"Menghubungkan ke Deriv Gateway: {Config.DERIV_WS_URL}...")
+                logger.info(f"Menghubungkan ke Deriv WebSocket: {Config.DERIV_WS_URL}...")
                 async with aiohttp.ClientSession() as session:
                     async with session.ws_connect(Config.DERIV_WS_URL, timeout=30, heartbeat=20) as ws:
-                        logger.info(f"WebSocket Terhubung! Mengirim langganan candle untuk {Config.SYMBOL}...")
+                        logger.info(f"WebSocket Terhubung! Melakukan subscribe ke {Config.SYMBOL}...")
                         
-                        # Request historical candles + continuous stream subscription
                         subscribe_req = {
                             "ticks_history": Config.SYMBOL,
                             "adjust_start_time": 1,
@@ -642,18 +577,22 @@ class ASIAutonomousOrchestrator:
 
                         async for msg in ws:
                             if not self.is_market_open():
-                                logger.info("[WEEKEND CLOSE DETECTED] Menutup koneksi untuk istirahat akhir pekan.")
+                                logger.info("[WEEKEND CLOSE] Penutupan pasar terdeteksi. Standby...")
                                 break
 
                             if msg.type == aiohttp.WSMsgType.TEXT:
                                 data = json.loads(msg.data)
                                 
                                 if "error" in data:
-                                    logger.error(f"[DERIV PROTOCOL ERROR] {data['error']['message']}")
-                                    await asyncio.sleep(5)
+                                    err_code = data.get("error", {}).get("code", "")
+                                    logger.error(f"[DERIV ERROR] {data['error']['message']}")
+                                    if "MarketIsClosed" in err_code:
+                                        logger.info("[MARKET CLOSED] Server mengonfirmasi market sedang libur. Tidur 15 menit...")
+                                        await asyncio.sleep(900)
+                                    else:
+                                        await asyncio.sleep(5)
                                     break
                                 
-                                # Initial history batch
                                 if "candles" in data:
                                     raw_candles = data["candles"]
                                     self.candles = [
@@ -668,25 +607,24 @@ class ASIAutonomousOrchestrator:
                                     logger.info(f"Berhasil memuat {len(self.candles)} candlestick riwayat.")
                                     await self.evaluate_market_matrix()
                                     
-                                # Continuous live streaming update
                                 elif "ohlc" in data:
                                     await self.process_incoming_candle(data["ohlc"])
                                     
                             elif msg.type in (aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.ERROR):
-                                logger.warning(f"[WS DISCONNECT] Tipe pesan: {msg.type}. Memulai reconnect...")
+                                logger.warning("[WS CLOSED] Koneksi terputus. Mengulang koneksi...")
                                 break
 
             except aiohttp.ClientConnectorError as e:
-                logger.error(f"[NETWORK ERROR] Gagal terhubung ke host: {e}. Retry dalam 10 detik...")
+                logger.error(f"[NETWORK ERROR] Gagal koneksi: {e}. Retry 10 detik...")
                 await asyncio.sleep(10)
             except asyncio.TimeoutError:
-                logger.warning("[TIMEOUT] Tidak ada respon dari WebSocket. Melakukan refresh koneksi...")
+                logger.warning("[TIMEOUT] Refresh koneksi...")
                 await asyncio.sleep(3)
             except Exception as e:
-                logger.critical(f"[UNEXPECTED EXCEPTION] {e}", exc_info=True)
+                logger.critical(f"[CRITICAL ERROR] {e}", exc_info=True)
                 await asyncio.sleep(5)
 
-            logger.info("[AUTO-HEALING] Reconnecting ke Deriv Server dalam 5 detik...")
+            logger.info("[AUTO-HEALING] Reconnecting dalam 5 detik...")
             await asyncio.sleep(5)
 
 
@@ -699,14 +637,10 @@ def main():
     ================================================================
     """)
     orchestrator = ASIAutonomousOrchestrator()
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
     try:
-        loop.run_until_complete(orchestrator.run_deriv_stream())
+        asyncio.run(orchestrator.run_deriv_stream())
     except KeyboardInterrupt:
-        logger.info("[SHUTDOWN] Bot dimatikan oleh user secara aman.")
-    finally:
-        loop.close()
+        logger.info("[SHUTDOWN] Bot dihentikan secara aman.")
 
 if __name__ == "__main__":
     main()
