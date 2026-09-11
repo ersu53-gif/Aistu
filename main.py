@@ -40,7 +40,7 @@ logger = logging.getLogger("ASI-Omega")
 # --- CONFIGURATION ENGINE ---
 class Config:
     DERIV_WS_URL = "wss://ws.derivws.com/websockets/v3?app_id=1089"
-    SYMBOL = "gold"  # Symbol resmi Gold di WebSocket API Deriv
+    SYMBOL = "frxXAUUSD"  # Symbol resmi XAU/USD (Gold) di WebSocket API Deriv
     GRANULARITY = 60  # 1-Minute Candles for ultra-precise entry
     HISTORY_COUNT = 150
     
