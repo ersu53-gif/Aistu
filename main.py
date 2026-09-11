@@ -4,7 +4,7 @@
 ASI-OMEGA: AUTONOMOUS MULTI-DISCIPLINARY XAUUSD TRADING MATRIX
 Engineered by: Director of Artificial Superintelligence
 Features:
-- Deriv Dynamic Symbol Auto-Discovery Engine (Fixes 'Symbol Invalid' Errors)
+- Dynamic Active Symbol Discovery Engine (Resolves 'Symbol Invalid' Errors)
 - SMC Micro-Liquidity Sweep Detection + FVG (Fair Value Gap)
 - Quantitative Adaptive Volatility Bands (Ultra-Tight SL Engine)
 - Online Recursive Self-Improvement Memory via SQLite
@@ -42,8 +42,8 @@ class Config:
     APP_ID = os.getenv("DERIV_APP_ID", "1089").strip()
     DERIV_WS_URL = f"wss://ws.derivws.com/websockets/v3?app_id={APP_ID}"
     
-    # Keyword pencarian otomatis instrumen Emas
-    GOLD_KEYWORDS = ["XAUUSD", "GOLD", "FRXXAUUSD"]
+    # Keyword kandidat pencarian Emas di Deriv API (diurutkan berdasarkan prioritas)
+    GOLD_CANDIDATE_KEYWORDS = ["XAUUSD", "GOLD", "XAU", "FRXXAUUSD"]
     
     GRANULARITY = 60  # 1-Minute Candles
     HISTORY_COUNT = 150
@@ -361,7 +361,7 @@ class ASIAutonomousOrchestrator:
         self.telegram = TelegramGuard(Config.TELEGRAM_BOT_TOKEN, Config.TELEGRAM_CHAT_ID)
         self.candles: List[Dict] = []
         self.last_signal_timestamp = 0.0
-        self.active_gold_symbol: str = "frxXAUUSD" # Simbol resmi standar Deriv untuk Emas
+        self.active_gold_symbol: Optional[str] = None
 
     def is_market_open(self) -> bool:
         now_utc = datetime.now(timezone.utc)
@@ -375,6 +375,45 @@ class ASIAutonomousOrchestrator:
         if weekday == 4 and hour >= 22:
             return False
         return True
+
+    async def discover_active_gold_symbol(self, ws: aiohttp.ClientWebSocketResponse) -> str:
+        """Meminta daftar active_symbols dari Deriv dan secara otomatis memilih simbol Emas yang valid."""
+        logger.info("Mengirim permintaan 'active_symbols' ke Deriv API...")
+        req = {
+            "active_symbols": "brief",
+            "product_type": "basic"
+        }
+        await ws.send_json(req)
+        
+        try:
+            msg = await asyncio.wait_for(ws.receive_json(), timeout=10.0)
+            if "active_symbols" in msg:
+                symbols = msg["active_symbols"]
+                # 1. Cari simbol yang persis mengandung kata Emas/XAUUSD dan sedang buka
+                for kw in Config.GOLD_CANDIDATE_KEYWORDS:
+                    for s in symbols:
+                        sym_code = s.get("symbol", "")
+                        sym_name = s.get("display_name", "").upper()
+                        is_open = s.get("exchange_is_open") == 1
+                        
+                        if (kw in sym_code.upper() or kw in sym_name) and is_open:
+                            logger.info(f"[DISCOVERY SUCCESS] Ditemukan simbol Emas aktif: '{sym_code}' ({s.get('display_name')})")
+                            return sym_code
+                
+                # 2. Jika tidak ada yang pas 100% buka, ambil simbol yang berakhiran/mengandung XAUUSD apapun kondisinya
+                for s in symbols:
+                    sym_code = s.get("symbol", "")
+                    if "XAU" in sym_code.upper() or "GOLD" in sym_code.upper():
+                        logger.warning(f"[DISCOVERY FALLBACK] Memilih simbol Emas alternatif: '{sym_code}'")
+                        return sym_code
+
+        except Exception as e:
+            logger.error(f"[DISCOVERY ERROR] Gagal mendeteksi simbol otomatis: {e}")
+
+        # Default fallback darurat
+        fallback = "frxXAUUSD"
+        logger.warning(f"[DISCOVERY DEFAULT] Menggunakan fallback default: '{fallback}'")
+        return fallback
 
     def calculate_micro_sl_tp(self, direction: str, entry: float, sweep_extreme: Optional[float], atr_val: float) -> Tuple[float, float, float, float]:
         buffer = max(0.20, atr_val * 0.15)
@@ -492,7 +531,7 @@ class ASIAutonomousOrchestrator:
                 msg = (
                     f"⚡ <b>ASI-OMEGA TRADING SIGNAL</b> ⚡\n"
                     f"────────────────────────\n"
-                    f"Instrument: <code>XAU/USD (Gold)</code>\n"
+                    f"Instrument: <code>XAU/USD ({self.active_gold_symbol})</code>\n"
                     f"Order Type: <b>MANUAL OP</b>\n"
                     f"Action: {direction_emoji}\n"
                     f"Accuracy Probability: <b>{final_confidence*100:.1f}%</b>\n"
@@ -553,6 +592,10 @@ class ASIAutonomousOrchestrator:
                     async with session.ws_connect(Config.DERIV_WS_URL, timeout=30, heartbeat=20) as ws:
                         logger.info("WebSocket Terhubung!")
                         
+                        # Temukan simbol Emas yang valid secara otomatis jika belum di-set
+                        if not self.active_gold_symbol:
+                            self.active_gold_symbol = await self.discover_active_gold_symbol(ws)
+
                         logger.info(f"Melakukan subscribe stream candlestick ke: {self.active_gold_symbol}...")
                         subscribe_req = {
                             "ticks_history": self.active_gold_symbol,
@@ -578,8 +621,8 @@ class ASIAutonomousOrchestrator:
                                     logger.error(f"[DERIV ERROR] Code: {err_code} | Msg: {err_msg}")
                                     
                                     if "invalid" in err_msg.lower() or "SymbolInvalid" in err_code:
-                                        logger.warning("[RE-DISCOVERING] Simbol ditolak. Mencoba fallback alternatif...")
-                                        self.active_gold_symbol = "frxXAUUSD" if self.active_gold_symbol != "frxXAUUSD" else "GOLD"
+                                        logger.warning("[RE-DISCOVERING] Simbol ditolak oleh server. Mereset pilihan simbol...")
+                                        self.active_gold_symbol = None  # Reset agar mengambil simbol baru di reconnect berikutnya
                                         await asyncio.sleep(2)
                                         break
                                     elif "MarketIsClosed" in err_code:
@@ -601,7 +644,7 @@ class ASIAutonomousOrchestrator:
                                             "close": float(c["close"])
                                         } for c in raw_candles
                                     ]
-                                    logger.info(f"Berhasil memuat {len(self.candles)} candlestick riwayat untuk {self.active_gold_symbol}.")
+                                    logger.info(f"Berhasil memuat {len(self.candles)} candlestick riwayat untuk '{self.active_gold_symbol}'.")
                                     await self.evaluate_market_matrix()
                                     
                                 elif "ohlc" in data:
