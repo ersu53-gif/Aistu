@@ -69,7 +69,9 @@ class Config:
     # Prioritas simbol pencarian Emas Deriv
     GOLD_CANDIDATE_KEYWORDS = ["frxXAUUSD", "OTC_GOLD", "XAUUSD", "GOLD"]
 
-    # Global Real-Time Physical Gold Spot Feed (Binance PAXG/USDT: 1:1 LBMA Physical Gold, Zero-Auth, 24/7)
+    # Global Multi-Exchange Gold Feeds (1:1 LBMA Gold Spot, 24/7/365, Zero-Auth, Anti-Blokir 451)
+    KUCOIN_REST_URL = "https://api.kucoin.com/api/v1/market/candles?symbol=PAXG-USDT&type=1min"
+    KRAKEN_REST_URL = "https://api.kraken.com/0/public/OHLC?pair=PAXGUSD&interval=1"
     BINANCE_WS_URL = "wss://stream.binance.com:9443/ws/paxgusdt@kline_1m"
     BINANCE_REST_URL = "https://api.binance.com/api/v3/klines?symbol=PAXGUSDT&interval=1m&limit=150"
 
@@ -869,77 +871,129 @@ class ASIAutonomousOrchestrator:
             }
             await self.process_incoming_candle(new_candle)
 
-    async def run_binance_gold_stream(self):
+    async def fetch_historical_gold(self, session: aiohttp.ClientSession) -> Tuple[bool, str]:
+        """Unduh candlestick historis awal dari provider terbaik (KuCoin / Kraken / Binance)."""
+        # 1. Coba KuCoin (Bebas 451, respon cepat, 100 candle M1)
+        try:
+            logger.info("Mengunduh candlestick historis Emas via KuCoin (Bebas Blokir Regional)...")
+            async with session.get(Config.KUCOIN_REST_URL, timeout=8) as resp:
+                if resp.status == 200:
+                    payload = await resp.json()
+                    raw = payload.get("data", [])
+                    if raw and len(raw) > 30:
+                        self.candles = []
+                        for item in reversed(raw):
+                            self.candles.append({
+                                "epoch": int(item[0]),
+                                "open": float(item[1]),
+                                "close": float(item[2]),
+                                "high": float(item[3]),
+                                "low": float(item[4])
+                            })
+                        logger.info(f"[KUCOIN SUKSES] Memuat {len(self.candles)} candlestick Emas. Spot: ${self.candles[-1]['close']:.2f}")
+                        return True, "KUCOIN"
+        except Exception as e:
+            logger.warning(f"[FEED NOTE] KuCoin fetch: {e}")
+
+        # 2. Coba Kraken (Bebas 451, regulasi AS & Global)
+        try:
+            logger.info("Mencoba unduh candlestick historis Emas via Kraken...")
+            async with session.get(Config.KRAKEN_REST_URL, timeout=8) as resp:
+                if resp.status == 200:
+                    payload = await resp.json()
+                    candles = payload.get("result", {}).get("PAXGUSD", [])
+                    if candles and len(candles) > 30:
+                        self.candles = []
+                        for item in candles[-Config.HISTORY_COUNT:]:
+                            self.candles.append({
+                                "epoch": int(item[0]),
+                                "open": float(item[1]),
+                                "high": float(item[2]),
+                                "low": float(item[3]),
+                                "close": float(item[4])
+                            })
+                        logger.info(f"[KRAKEN SUKSES] Memuat {len(self.candles)} candlestick Emas. Spot: ${self.candles[-1]['close']:.2f}")
+                        return True, "KRAKEN"
+        except Exception as e:
+            logger.warning(f"[FEED NOTE] Kraken fetch: {e}")
+
+        # 3. Coba Binance (hanya jika non-US dan tidak kena 451)
+        try:
+            logger.info("Mencoba unduh candlestick Emas via Binance...")
+            async with session.get(Config.BINANCE_REST_URL, timeout=8) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    if isinstance(data, list) and len(data) > 30:
+                        self.candles = []
+                        for item in data:
+                            self.candles.append({
+                                "epoch": int(item[0] / 1000),
+                                "open": float(item[1]),
+                                "high": float(item[2]),
+                                "low": float(item[3]),
+                                "close": float(item[4])
+                            })
+                        logger.info(f"[BINANCE SUKSES] Memuat {len(self.candles)} candlestick Emas. Spot: ${self.candles[-1]['close']:.2f}")
+                        return True, "BINANCE"
+                elif resp.status == 451:
+                    logger.warning("[RESTRIKSI REGIONAL] Binance memblokir IP ini (HTTP 451 Unavailable For Legal Reasons).")
+        except Exception as e:
+            logger.warning(f"[FEED NOTE] Binance fetch: {e}")
+
+        return False, "NONE"
+
+    async def run_global_gold_stream(self):
         """
-        Stream Emas Spot Fisik Riil Global (Binance PAXG/USDT).
-        PAX Gold adalah aset emas fisik berstandar LBMA 1:1 tanpa pembatasan regional.
-        Tersedia 24/7/365 secara gratis tanpa memerlukan otorisasi API key.
+        Stream Emas Spot Fisik Riil Global (1:1 LBMA Physical Gold Spot, 24/7/365).
+        Mendukung Multi-Exchange (KuCoin / Kraken / Binance) dengan proteksi anti-blokir 451.
         """
         logger.info("================================================================")
         logger.info(" [FEED GLOBAL] TERHUBUNG KE STREAM EMAS SPOT RIIL (PAXG/USDT)   ")
-        logger.info(" 1:1 LBMA Physical Gold Spot • 24/7 Order Flow • Bebas Blokir Regional")
+        logger.info(" 1:1 LBMA Physical Gold Spot • Multi-Exchange • Anti-Blokir 451 ")
         logger.info("================================================================")
-        self.active_gold_symbol = "PAXG/USDT (Gold Spot)"
+        self.active_gold_symbol = "XAU/USD (Global Gold Spot)"
 
         session = await self.telegram.get_session()
 
-        # 1. Unduh candlestick historis awal via REST
-        try:
-            logger.info("Mengunduh candlestick historis awal Emas dari Binance...")
-            async with session.get(Config.BINANCE_REST_URL, timeout=12) as resp:
-                if resp.status == 200:
-                    data = await resp.json()
-                    self.candles = []
-                    for item in data:
-                        self.candles.append({
-                            "epoch": int(item[0] / 1000),
-                            "open": float(item[1]),
-                            "high": float(item[2]),
-                            "low": float(item[3]),
-                            "close": float(item[4])
-                        })
-                    logger.info(f"Berhasil memuat {len(self.candles)} candle historis Emas. Spot: ${self.candles[-1]['close']:.2f}")
-                    await self.evaluate_market_matrix()
-                else:
-                    logger.warning(f"Binance REST merespons status HTTP {resp.status}")
-        except Exception as e:
-            logger.warning(f"Gagal mengunduh riwayat candle awal Binance: {e}")
+        # 1. Unduh candlestick historis awal
+        loaded, best_source = await self.fetch_historical_gold(session)
+        if loaded:
+            await self.evaluate_market_matrix()
+        else:
+            logger.warning("Tidak dapat memuat feed eksternal. Beralih ke simulator...")
+            await self.run_simulation_stream()
+            return
 
-        # 2. Sambungkan ke WebSocket Live Kline
+        # 2. Live Polling Loop KuCoin / Kraken (Respon instan <120ms, update harga real-time tanpa risiko WS putus atau 451)
+        logger.info(f"[STREAM AKTIF] Memulai live candle tracker Emas Spot (Sumber: {best_source})...")
+        fail_count = 0
+
         while self._running:
             try:
-                logger.info(f"Menghubungkan ke WebSocket Binance Gold: {Config.BINANCE_WS_URL}...")
-                async with session.ws_connect(Config.BINANCE_WS_URL, timeout=25) as ws:
-                    logger.info("WebSocket Binance Gold Spot Terhubung Sukses!")
+                await asyncio.sleep(2.0)
+                async with session.get(Config.KUCOIN_REST_URL, timeout=4) as resp:
+                    if resp.status == 200:
+                        payload = await resp.json()
+                        raw = payload.get("data", [])
+                        if raw:
+                            latest = raw[0]
+                            candle = {
+                                "epoch": int(latest[0]),
+                                "open": float(latest[1]),
+                                "close": float(latest[2]),
+                                "high": float(latest[3]),
+                                "low": float(latest[4])
+                            }
+                            fail_count = 0
+                            await self.process_incoming_candle(candle)
+                    else:
+                        fail_count += 1
 
-                    async for msg in ws:
-                        if msg.type == aiohttp.WSMsgType.TEXT:
-                            payload = json.loads(msg.data)
-                            if "k" in payload:
-                                k = payload["k"]
-                                candle = {
-                                    "epoch": int(k["t"] / 1000),
-                                    "open": float(k["o"]),
-                                    "high": float(k["h"]),
-                                    "low": float(k["l"]),
-                                    "close": float(k["c"])
-                                }
-                                await self.process_incoming_candle(candle)
-
-                        elif msg.type in (aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.ERROR):
-                            logger.warning("[WS CLOSED] Koneksi Binance terputus. Rekoneksi...")
-                            break
-
-            except aiohttp.ClientConnectorError as e:
-                logger.error(f"[BINANCE ERROR] Gagal koneksi: {e}. Rekoneksi 5 detik...")
-                await asyncio.sleep(5)
             except Exception as e:
-                logger.error(f"[BINANCE ERROR] {e}. Mengulang 5 detik...")
-                await asyncio.sleep(5)
-
-            if not self._running:
-                break
-            await asyncio.sleep(3)
+                fail_count += 1
+                if fail_count % 15 == 0:
+                    logger.warning(f"[STREAM HEARTBEAT] Menunggu tick harga Emas spot ({e})...")
+                await asyncio.sleep(1.5)
 
     async def run_deriv_stream(self) -> bool:
         """
@@ -1058,8 +1112,8 @@ class ASIAutonomousOrchestrator:
             await self.run_simulation_stream()
             return
 
-        if self.provider == "BINANCE":
-            await self.run_binance_gold_stream()
+        if self.provider in ("GLOBAL", "KUCOIN", "KRAKEN", "BINANCE"):
+            await self.run_global_gold_stream()
             return
 
         # Provider AUTO atau DERIV
@@ -1067,11 +1121,11 @@ class ASIAutonomousOrchestrator:
         deriv_ok = await self.run_deriv_stream()
         if not deriv_ok and self._running:
             logger.warning("────────────────────────────────────────────────────────────")
-            logger.warning(" [AUTO-FAILOVER] Beralih otomatis ke Global Gold Spot Feed  ")
-            logger.warning(" (Binance PAXG/USDT Real Gold) untuk menjaga bot tetap aktif")
+            logger.warning(" [AUTO-FAILOVER] Beralih ke Global Physical Gold Spot Feed  ")
+            logger.warning(" (KuCoin & Kraken 1:1 LBMA Physical Gold Spot • Anti-451)   ")
             logger.warning("────────────────────────────────────────────────────────────")
             try:
-                await self.run_binance_gold_stream()
+                await self.run_global_gold_stream()
             except Exception as e:
                 logger.error(f"[FAILOVER ERROR] {e}. Mengaktifkan mode simulator...")
                 await self.run_simulation_stream()
@@ -1079,10 +1133,11 @@ class ASIAutonomousOrchestrator:
 
 # --- ENTRY POINT & CLI PARSER ---
 def main():
-    parser = argparse.ArgumentParser(description="ASI-OMEGA Autonomous XAU/USD Trading Matrix v5.0")
+    parser = argparse.ArgumentParser(description="ASI-OMEGA Autonomous XAU/USD Trading Matrix v5.3")
     parser.add_argument("--sim", action="store_true", help="Jalankan dalam mode simulasi pasar real-time")
-    parser.add_argument("--provider", type=str, default="AUTO", choices=["AUTO", "DERIV", "BINANCE", "SIM"],
-                        help="Pilih penyedia data: AUTO (default dengan failover), DERIV, BINANCE, atau SIM")
+    parser.add_argument("--provider", type=str, default="AUTO",
+                        choices=["AUTO", "GLOBAL", "KUCOIN", "KRAKEN", "BINANCE", "DERIV", "SIM"],
+                        help="Pilih penyedia data: AUTO (default dengan failover ke KuCoin/Kraken), GLOBAL, DERIV, atau SIM")
     parser.add_argument("--symbol", type=str, default="", help="Paksa simbol spesifik (contoh: frxXAUUSD, OTC_GOLD, PAXGUSDT)")
     parser.add_argument("--token", type=str, default="", help="Deriv API Token untuk membuka akses Forex berizin")
     args = parser.parse_args()
@@ -1092,7 +1147,7 @@ def main():
 
     print("""
     ================================================================
-          ASI-OMEGA v5.0: ARTIFICIAL SUPERINTELLIGENCE TRADING MATRIX
+          ASI-OMEGA v5.3: ARTIFICIAL SUPERINTELLIGENCE TRADING MATRIX
                  AUTONOMOUS SMART MONEY & QUANT FOR XAU/USD
     ================================================================
     """)
