@@ -1,8 +1,12 @@
-name: XAU V7.3 Perfect
+name: XAU V7.4 ALL SESSION
 on:
   schedule:
     - cron: '*/15 * * * *'
   workflow_dispatch:
+
+permissions:
+  contents: write
+
 jobs:
   sniper:
     runs-on: ubuntu-latest
@@ -10,25 +14,27 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
       - uses: actions/setup-python@v5
         with:
           python-version: '3.11'
+
       - run: pip install requests pandas --quiet
-      - name: Pull last signal
-        run: |
-          git pull origin main || true
-          echo "[]" > last_signal.json || true
-          ls -la last_signal.json || echo '{}' > last_signal.json
-      - env:
+
+      - name: Run V7.4 ALL SESSION
+        env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: |
           sleep $((RANDOM % 30 + 5))
           python main.py
-      - name: Save anti-spam
+
+      - name: Save anti-spam lock
         run: |
           git config user.name "bot"
           git config user.email "bot@bot.com"
+          git pull --rebase origin main || true
           git add last_signal.json || true
-          git commit -m "lock $(date -u)" || echo "no change"
-          git push || true
+          git commit -m "lock $(date -u) all session" || echo "no changes"
+          git push origin main || true
