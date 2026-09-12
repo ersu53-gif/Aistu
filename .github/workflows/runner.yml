@@ -8,15 +8,17 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/cache@v4
         with:
-          path: last_signal.json
-          key: v73-${{ github.run_id }}
-          restore-keys: v73-
+          fetch-depth: 0
       - uses: actions/setup-python@v5
         with:
           python-version: '3.11'
       - run: pip install requests pandas --quiet
+      - name: Pull last signal
+        run: |
+          git pull origin main || true
+          echo "[]" > last_signal.json || true
+          ls -la last_signal.json || echo '{}' > last_signal.json
       - env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
@@ -28,5 +30,5 @@ jobs:
           git config user.name "bot"
           git config user.email "bot@bot.com"
           git add last_signal.json || true
-          git commit -m "spam lock" || true
+          git commit -m "lock $(date -u)" || echo "no change"
           git push || true
